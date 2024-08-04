@@ -1,0 +1,26 @@
+{
+  "name": "worlds-smallest-queue",
+  "version": "0.1.0",
+  "description": "A stupid-simple Postgres-backed queue",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.test.json",
+    "lint": "eslint ./src ./test",
+    "test": "tsx ./test/index.ts",
+    "build": "rm -rf ./dist && tsc -p tsconfig.json"
+  },
+  "author": "James Conkling <james.lane.conkling@gmail.com> jameslaneconkling.github.io",
+  "license": "ISC",
+  "devDependencies": {
+    "@eslint/js": "^9.8.0",
+    "@types/tape": "^5.6.4",
+    "eslint": "^9.8.0",
+    "globals": "^15.9.0",
+    "tape": "^5.8.1",
+    "tsx": "^4.16.5",
+    "typescript": "^5.5.4",
+    "typescript-eslint": "^8.0.0"
+  }
+}
