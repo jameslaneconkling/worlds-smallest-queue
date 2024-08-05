@@ -13,7 +13,6 @@ A stupid-simple Postgres-backed queue
 ## Terminology
 - **message**: a single serializable datastructure to enqueue and dequeue
 - **partition**: an arbitrary subset of messages defined during message creation. as long as partitions remain reletively small/high cardinality, retrieving counts and lists of unprocessed messages per partition should remain efficient
-- **messenger**: a function that dequeues messages, processes them, re-enqueues them on error, and deletes them on success. scale concurrent messengers up or down to easily manage throughput
 
 ## Usage
 ```ts

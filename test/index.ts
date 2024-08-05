@@ -1,6 +1,6 @@
 import test from 'tape'
 import pg from 'pg'
-import { createQueue, destroyQueue, enqueue, flush, Handler, Message, messenger } from '../src'
+import { createQueue, destroyQueue, enqueue, flush, Message, dequeue } from '../src'
 
 if (process.env.PG_PORT === undefined) {
   console.error('missing PG_PORT env variable')
@@ -18,41 +18,55 @@ const PG_CONFIG = {
 }
 
 try {
-  await destroyQueue(new pg.Client(PG_CONFIG))
+  await destroyQueue(PG_CONFIG)
 } catch (e) {
   if (e && e.routine !== 'DropErrorMsgNonExistent') {
     console.error(e)
   }
 }
-
-await createQueue(new pg.Client(PG_CONFIG))
+await createQueue(PG_CONFIG)
 
 test('enqueue messages', async (t) => {
   const partition = 1
   const pool = new pg.Pool(PG_CONFIG)
-  
   let messageCounter = 0
-  const destroy = messenger(
+  let client: pg.PoolClient | undefined
+  
+  // enqueue 3 messages
+  try {
+    client = await pool.connect()
+    await enqueue([{ event: 'abc' }, { event: 'def' }, { event: 'abc' }], partition, client)
+  } finally {
+    client?.release()
+  }
+
+  // begin dequeueing messages
+  const destroy = dequeue(
     async (message: Message<{ event: string }>) => {
       messageCounter++
-      t.ok(message.body.event === 'abc' || message.body.event === 'def', 'message body is correct')
+      t.ok(message.body.event === 'abc' || message.body.event === 'def' || message.body.event === 'ghi', 'message body is correct')
     },
     { pool }
   )
 
-  const client = await pool.connect()
-  await enqueue([{ event: 'abc' }, { event: 'def' }, { event: 'abc' }], partition, client)
-  client.release()
+  // enqueue more messages
+  try {
+    client = await pool.connect()
+    await enqueue([{ event: 'ghi' }, { event: 'def' }], partition, client)
+  } finally {
+    client?.release()
+  }
 
-  await flush(partition, new pg.Client(PG_CONFIG))
-  t.equals(messageCounter, 3, 'processed correct number of enqueued messages')
+  // clean up
+  await flush(PG_CONFIG)
+  t.equals(messageCounter, 5, 'processed correct number of enqueued messages')
   destroy()
   await pool.end()
 })
 
 test.onFinish(async () => {
   try {
-    await destroyQueue(new pg.Client(PG_CONFIG))
+    await destroyQueue(PG_CONFIG)
   } catch (e) {
     console.error('onFinish Error', e)
   }
