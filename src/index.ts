@@ -1,219 +1,163 @@
-import pg from 'pg'
-import { logError, logInfo, sleep } from 'utils'
+import { type Pool, type ClientBase, PoolClient } from 'pg'
+import { createLogger, sleep, loop } from './utils.js'
 
 
-/* types */
-export type Message<Body extends Record<string, string> = Record<string, never>> = {
+export type Message<Body = unknown> = {
   id: number,
   partition: number,
   body: Body
-  created_at: number,
   retry_count: number,
+  created_at: Date,
+  retry_at: Date,
 }
 
-export type Handler<Body extends Record<string, string> = Record<string, never>> = (message: Message<Body>) => Promise<void>
+export type Handler<Body> = (message: Message<Body>, client: ClientBase) => Promise<unknown>
+
+export type Logger = {
+  info: (key: string, message?: Message, instanceId?: string) => void
+  error: (key: string, error: unknown, message?: Message, instanceId?: string) => void
+}
 
 export type Config = {
-  pool: pg.Pool,
-  errorRetryInterval: number,
-  pollInterval: number,
-  maxRetryCount: number,
-  processMessageTimeout: number,
-  messengerId: string
+  pool: Pool,
+  errorRetryInterval?: number,
+  pollInterval?: number,
+  maxRetryCount?: number,
+  dequeueTimeout?: number,
+  instanceId?: string,
+  logLevel?: 'INFO' | 'ERROR',
+  logger?: Logger
 }
 
-/* private functions */
-const dequeueMessage = async <Body extends Record<string, string> = Record<string, never>>(client: pg.PoolClient) => {
-  return (await client.query<Message<Body>>(`
-WITH RECURSIVE partitions AS (
-  -- get all distinct partitions for enqueued rows: https://wiki.postgresql.org/wiki/Loose_indexscan
-  (SELECT partition FROM messages ORDER BY partition ASC LIMIT 1)
-  UNION ALL
-  SELECT (SELECT partition FROM messages WHERE partition > partitions.partition ORDER BY partition ASC LIMIT 1)
-  FROM partitions
-  WHERE partitions.partition IS NOT NULL
-)
-DELETE FROM messages
-WHERE id = (
-  SELECT id
-  FROM messages
-  WHERE partition = (
-    SELECT partition
-    FROM partitions
-    WHERE partition IS NOT NULL
-    ORDER BY RANDOM()
-    LIMIT 1
-  )
-  ORDER BY id ASC
-  FOR UPDATE SKIP LOCKED
-  LIMIT 1
-)
-RETURNING *
-  `)).rows[0]
+export const setupPGQueue = () => `
+  CREATE TABLE messages (
+    id bigserial NOT NULL,
+    partition integer NOT NULL,
+    body JSONB NOT NULL,
+    retry_count integer NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    retry_at TIMESTAMPTZ,
+    PRIMARY KEY (partition, id)
+  );
+  CREATE TABLE dead_messages (
+    id bigint NOT NULL,
+    partition integer NOT NULL,
+    body JSONB NOT NULL,
+    retry_count integer NOT NULL,
+    error text NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    errored_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (partition, id)
+  );
+`
+
+export const teardownPGQueue = () => 'DROP TABLE messages; DROP TABLE dead_messages'
+
+export const enqueue = <Body>(messages: Body[], partition: number) => {
+  return `INSERT INTO messages (partition, body) VALUES ${messages.map((message) => `(${partition}, '${JSON.stringify(message)}')`).join(', ')}`
 }
 
-const processMessage = async <Body extends Record<string, string> = Record<string, never>>(client: pg.PoolClient, handler: Handler<Body>, config: Config) => {
+const _dequeue = async <Body>(handler: Handler<Body>, client: ClientBase, _config: Required<Config>) => {
   let message: Message<Body> | undefined
 
   try {
-    await client.query('SET idle_in_transaction_session_timeout=' + config.processMessageTimeout)
+    await client.query('SET idle_in_transaction_session_timeout=' + _config.dequeueTimeout)
+    await client.query('SET idle_session_timeout=' + _config.dequeueTimeout)
     await client.query('BEGIN')
-    message = await dequeueMessage(client)
+    message = (await client.query<Message<Body>>(`
+      WITH RECURSIVE partitions AS (
+        -- get all distinct partitions for enqueued rows: https://wiki.postgresql.org/wiki/Loose_indexscan
+        (SELECT partition FROM messages ORDER BY partition ASC LIMIT 1)
+        UNION ALL
+        SELECT (SELECT partition FROM messages WHERE partition > partitions.partition ORDER BY partition ASC LIMIT 1)
+        FROM partitions
+        WHERE partitions.partition IS NOT NULL
+      )
+      DELETE FROM messages
+      WHERE id = (
+        SELECT id
+        FROM messages
+        WHERE partition = (
+          SELECT partition
+          FROM partitions
+          WHERE partition IS NOT NULL
+          ORDER BY RANDOM()
+          LIMIT 1
+        )
+          AND (retry_at IS NULL OR retry_at <= NOW())
+        ORDER BY partition ASC, id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+      )
+      RETURNING *
+    `)).rows[0]
   } catch (error) {
-    logError('dequeue_message_error', config.messengerId, error)
+    _config.logger.error('dequeue_message_error', error, undefined, _config.instanceId)
     await client.query('ROLLBACK')
-    await sleep(config.errorRetryInterval)
+    await sleep(_config.errorRetryInterval)
     return
   }
 
   if (message === undefined) {
     await client.query('COMMIT')
-    await sleep(config.pollInterval)
+    await sleep(_config.pollInterval)
     return
   }
 
   try {
-    logInfo('process_message', config.messengerId)
-    await handler(message)
+    _config.logger.info('processing_message', message, _config.instanceId)
+    await handler(message, client)
     await client.query('COMMIT')
-    return
   } catch (error) {
-    if (message.retry_count < config.maxRetryCount) {
-      logError('process_message_error', config.messengerId, error)
-      await sleep(config.errorRetryInterval)
-      await client.query('ROLLBACK')
-      await client.query(`
-        UPDATE messages
-        SET retry_count = retry_count + 1
-        WHERE partition = $1 AND id = $2
-      `, [message.partition, message.id])
-      return
-    } else {
-      logError('process_message_error_max_retry', config.messengerId, error)
-      try {
-        client.query(`
-          INSERT INTO upload_row_errors (id, partition, body, error)
-          VALUES ($1, $2, $3, $4)
-        `, [message.id, message.partition, message.body, error])
-        await client.query('COMMIT')
-      } catch (error) {
-        logError('upload_row_error_insert_failed', config.messengerId, error)
+    try {
+      if (message.retry_count < _config.maxRetryCount) {
+        _config.logger.error('message_failure', error, message, _config.instanceId)
         await client.query('ROLLBACK')
-      }
-      return
-    }
-  }
-}
-
-/* public functions */
-export const createQueue = async (config: pg.ClientConfig | string) => {
-  const client = new pg.Client(config)
-  let error: unknown | undefined
-
-  try {
-    await client.connect()
-    await client.query(`
-      CREATE TABLE messages (
-        id bigserial NOT NULL,
-        partition integer NOT NULL,
-        body JSONB NOT NULL,
-        retry_count integer NOT NULL DEFAULT 0,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (partition, id)
-      );
-      
-      CREATE TABLE dead_messages (
-        id bigint NOT NULL,
-        partition integer NOT NULL,
-        body JSONB NOT NULL,
-        error text NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (partition, id)
-      );
-    `)
-  } catch (e) {
-    error = e
-  } finally {
-    await client.end()
-    if (error !== undefined) {
-      throw error
-    }
-  }
-}
-
-export const destroyQueue = async (pgConfig: pg.ClientConfig | string) => {
-  const client = new pg.Client(pgConfig)
-  let error: unknown | undefined
-
-  try {
-    await client.connect()
-    await client.query('DROP TABLE messages; DROP TABLE dead_messages')
-  } catch (e) {
-    error = e
-  } finally {
-    await client.end()
-    if (error !== undefined) {
-      throw error
-    }
-  }
-}
-
-export const flush = async (pgConfig: pg.ClientConfig | string) => {
-  const client = new pg.Client(pgConfig)
-  let error: unknown | undefined
-
-  try {
-    await client.connect()
-    while (true) {
-      if ((await client.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0) {
-        break
+        await client.query(`
+          UPDATE messages
+          SET retry_at = NOW() + ($1 * (2 ^ retry_count)) * INTERVAL '1 ms',
+            retry_count = retry_count + 1
+          WHERE partition = $2 AND id = $3
+        `, [_config.errorRetryInterval, message.partition, message.id])
       } else {
-        sleep(100)
+        _config.logger.error('message_failure_max_retry', error, message, _config.instanceId)
+        client.query(`
+          INSERT INTO dead_messages (id, partition, body, retry_count, error, created_at)
+          VALUES ($1, $2, $3, $4, $5, $6)
+        `, [message.id, message.partition, message.body, message.retry_count, error, message.created_at])
+        await client.query('COMMIT')
       }
-    }
-  } catch (e) {
-    error = e
-  } finally {
-    // if client.connect() fails, then client.end() will fail too. pooling is safer here, b/c the client is undefined if it's not successfully retrieved from the pool
-    await client.end()
-    if (error !== undefined) {
-      throw error
+    } catch (error) {
+      _config.logger.error('message_failure_connection_error', error, message, _config.instanceId)
+      await sleep(_config.errorRetryInterval)
     }
   }
 }
 
-export const enqueue = async <Body = Record<string, never>>(messages: Body[], partition: number, client: pg.ClientBase) => {
-  await client.query(`INSERT INTO messages (partition, body) VALUES ${
-      // TODO - escape
-    messages.map((message) => `(${partition}, '${JSON.stringify(message)}')`).join(', ')
-  }`)
-}
-
-export const dequeue = <Body extends Record<string, string> = Record<string, never>>(handler: Handler<Body>, queueConfig?: Partial<Config>) => {
-  const _queueConfig: Config = {
-    pool: queueConfig?.pool ?? new pg.Pool(),
-    errorRetryInterval: queueConfig?.errorRetryInterval ?? 2000,
-    pollInterval: queueConfig?.pollInterval ?? 2000,
-    maxRetryCount: queueConfig?.maxRetryCount ?? 10,
-    processMessageTimeout: queueConfig?.processMessageTimeout ?? 1000 * 60 * 60 * 10, // 10 min
-    messengerId: queueConfig?.messengerId ?? '1'
+export const Queue = <Body>(handler: Handler<Body>, config: Config): () => Promise<void> => {
+  const _config: Required<Config> = {
+    pool: config.pool,
+    pollInterval: config.pollInterval ?? 2_000,               // 2s
+    errorRetryInterval: config.errorRetryInterval ?? 2_000,   // 2s
+    dequeueTimeout: config.dequeueTimeout ?? 60_000,          // 1min
+    maxRetryCount: config.maxRetryCount ?? 15,
+    instanceId: config.instanceId ?? '1',
+    logLevel: config.logLevel ?? 'ERROR',
+    logger: config.logger ?? createLogger(config.logLevel ?? 'ERROR')
   }
-  let running = true
 
-  ;(async () => {
-    while (running) {
-      let client: pg.PoolClient | undefined
-      try {
-        client = await _queueConfig.pool.connect()
-        await processMessage(client, handler, _queueConfig)
-      } catch (error) {
-        logError('unhandled_error', _queueConfig.messengerId, error)
-        await sleep(_queueConfig.errorRetryInterval)
-      } finally {
-        client?.release()
-      }
+  return loop(async () => {
+    let client: PoolClient | undefined
+    try {
+      client = await _config.pool.connect()
+      client.on('error', (error) => _config.logger.error('pg_client_error', error, undefined, _config.instanceId))
+      await _dequeue(handler, client, _config)
+    } catch (error) {
+      _config.logger.error('unhandled_error', error, undefined, _config.instanceId)
+      await sleep(_config.errorRetryInterval)
+    } finally {
+      client?.removeAllListeners()
+      client?.release()
     }
-  })()
-
-  return () => { running = false }
+  })
 }

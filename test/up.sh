@@ -18,4 +18,4 @@ set -e
 
 PGPASSWORD=test docker exec pg-test createdb -U postgres worlds-smallest-queue-test
 
-echo -e "POSTGRES PORT | \033[0;32m$PG_PORT\033[0m"
+echo -e "\033[0;32m$PG_PORT\033[0m"

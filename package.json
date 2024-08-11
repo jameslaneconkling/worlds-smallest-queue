@@ -8,23 +8,29 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.test.json",
     "lint": "eslint ./src ./test",
-    "test": "tsx ./test/index.ts",
+    "test": "tsx ./test/index.ts | tap-spec",
     "build": "rm -rf ./dist && tsc -p tsconfig.json"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jameslaneconkling/worlds-smallest-queue.git"
+  },
+  "keywords": ["queue", "postgres"],
   "author": "James Conkling <james.lane.conkling@gmail.com> jameslaneconkling.github.io",
-  "license": "ISC",
+  "license": "MIT",
   "devDependencies": {
-    "@eslint/js": "^9.8.0",
+    "@eslint/js": "^9.9.0",
     "@types/pg": "^8.11.6",
     "@types/tape": "^5.6.4",
-    "eslint": "^9.8.0",
+    "eslint": "^9.9.0",
     "globals": "^15.9.0",
+    "tap-spec": "^2.2.2",
     "tape": "^5.8.1",
     "tsx": "^4.16.5",
     "typescript": "^5.5.4",
-    "typescript-eslint": "^8.0.0"
+    "typescript-eslint": "^8.0.1"
   },
-  "dependencies": {
-    "pg": "^8.12.0"
+  "peerDependencies": {
+    "pg": "^8.x"
   }
 }
