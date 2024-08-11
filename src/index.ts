@@ -1,4 +1,4 @@
-import { type Pool, type ClientBase, PoolClient } from 'pg'
+import { type Pool, type ClientBase, type PoolClient } from 'pg'
 import { createLogger, sleep, loop } from './utils.js'
 
 
@@ -57,9 +57,10 @@ export const enqueue = <Body>(messages: Body[], partition: number) => {
   return `INSERT INTO messages (partition, body) VALUES ${messages.map((message) => `(${partition}, '${JSON.stringify(message)}')`).join(', ')}`
 }
 
-const _dequeue = async <Body>(handler: Handler<Body>, client: ClientBase, _config: Required<Config>) => {
+const _dequeue = async <Body>(handler: Handler<Body>, client: ClientBase, _config: Required<Config>): Promise<void> => {
   let message: Message<Body> | undefined
 
+  // dequeue message
   try {
     await client.query('SET idle_in_transaction_session_timeout=' + _config.dequeueTimeout)
     await client.query('SET idle_session_timeout=' + _config.dequeueTimeout)
@@ -91,19 +92,17 @@ const _dequeue = async <Body>(handler: Handler<Body>, client: ClientBase, _confi
       )
       RETURNING *
     `)).rows[0]
+    if (message === undefined) {
+      await client.query('COMMIT')
+      return await sleep(_config.pollInterval + ((Math.random() - 0.5) * 0.5 * _config.pollInterval))
+    }
   } catch (error) {
     _config.logger.error('dequeue_message_error', error, undefined, _config.instanceId)
     await client.query('ROLLBACK')
-    await sleep(_config.errorRetryInterval)
-    return
+    return await sleep(_config.errorRetryInterval + ((Math.random() - 0.5) * 0.5 * _config.errorRetryInterval))
   }
 
-  if (message === undefined) {
-    await client.query('COMMIT')
-    await sleep(_config.pollInterval)
-    return
-  }
-
+  // process message
   try {
     _config.logger.info('processing_message', message, _config.instanceId)
     await handler(message, client)
@@ -154,7 +153,7 @@ export const Queue = <Body>(handler: Handler<Body>, config: Config): () => Promi
       await _dequeue(handler, client, _config)
     } catch (error) {
       _config.logger.error('unhandled_error', error, undefined, _config.instanceId)
-      await sleep(_config.errorRetryInterval)
+      await sleep(_config.errorRetryInterval + ((Math.random() - 0.5) * 0.5 * _config.errorRetryInterval))
     } finally {
       client?.removeAllListeners()
       client?.release()

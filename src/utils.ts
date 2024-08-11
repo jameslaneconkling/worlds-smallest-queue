@@ -15,7 +15,7 @@ export const createLogger = (level: 'INFO' | 'ERROR'): Logger => ({
   error: level === 'ERROR' || level === 'INFO' ? _error : noop
 })
 
-export const sleep = async (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+export const sleep = async (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
 export const poll = async (asyncPredicate: () => Promise<boolean>, pollInterval: number, maxRetry: number) => {
   let retry = 0
