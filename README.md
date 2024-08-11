@@ -9,13 +9,13 @@ A stupid-simple Postgres-backed queue for Typescript
 
 
 ## Non-Goal
-- **maximize message throughput or minimize latency**: this library is intended for situations where the queue is fronting expensive business logic like a complex query to a resource-constrained system. the queue should handle significant message spikes and effectively rate limit message processing, but is not intended for scenarios where queue throughput itself is the main bottleneck. that said, this library _is_ fast, because Postgres is fast, and is capable of dequeueing thousands of messages per second.
+- **maximize message throughput or minimize latency**: this library is intended for situations where the queue is fronting expensive business logic like a complex query to a resource-constrained system. the queue can handle significant message spikes and effectively rate limit message processing, but is not intended for scenarios where queue throughput itself is the main bottleneck. that said, this library _is_ fast, because Postgres is fast, and is capable of processing thousands of messages per second.
 
 
 ## Terminology
 - **message**: a single serializable datastructure to enqueue and dequeue
 - **partition**: an arbitrary subset of messages defined during message creation. as long as partitions remain reletively small/high cardinality, retrieving counts and lists of unprocessed messages per partition should remain efficient. potential partition values could be a user id, an ip address, or anything property that is distributed evenly across all messages. partitioning is not required.
-- **queue**: a lightweight Queue instance that dequeues messages, processes them, and returns them to the queue on error
+- **queue**: a lightweight Queue instance that dequeues messages, processes them, and returns them to the queue on error. Queue instances can be created and destroyed efficiently and can run anywhere that has access to the backing Postgres database. Multiple instances can run efficiently in the same process or distributed across multiple processes.
 
 
 ## Usage
@@ -72,18 +72,19 @@ const teardown = Queue(async (message) => { await doWorkBeCool(message) }, { poo
 await destroy()
 ```
 
-To process multiple messages at the same time, create multiple queues.
+To process multiple messages at the same time, create multiple queues. Ensure the pool connection count is at least equal to the number of queue instances, and greater if other parts of the application need to query Postgres as well.
 ```ts
 import { Pool } from 'pg'
 import { Queue } from 'worlds-smallest-queue'
 
-const pool = new Pool()
+const pool = new Pool({ max: 20 })
 
 for (let i = 0; i < 10; i++) {
   Queue(async (message) => { await lookAliveMoveFast(message) }, { pool, instanceId: `${id}` })
 }
-
 ```
+
+If message processing is CPU bound, distribute the queue instances across multiple Node workers or multiple machines.
 
 ### enqueue
 `enqueue(messages: Message<Body>[], partition: number) => string`
@@ -184,3 +185,8 @@ export type Logger = {
   error: (key: string, error: unknown, message?: Message, instanceId?: string) => void
 }
 ```
+
+## See Also
+- [PGQ](https://wiki.postgresql.org/wiki/PGQ_Tutorial)
+- [Graphile Worker](https://worker.graphile.org/)
+- [PGMQ](https://pgt.dev/extensions/pgmq)

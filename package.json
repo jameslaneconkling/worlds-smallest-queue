@@ -31,6 +31,6 @@
     "typescript-eslint": "^8.0.1"
   },
   "peerDependencies": {
-    "pg": "^8.x"
+    "pg": "8.x"
   }
 }
