@@ -1,5 +1,5 @@
-import { type Pool, type ClientBase, type PoolClient } from 'pg'
-import { createLogger, sleep, loop } from './utils.js'
+import { type Pool, type ClientBase, type PoolClient, type Notification } from 'pg'
+import { createLogger, sleep, loop, asyncEvent } from './utils.js'
 
 
 export type Message<Body = unknown> = {
@@ -21,9 +21,9 @@ export type Logger = {
 export type Config = {
   pool: Pool,
   errorRetryInterval?: number,
-  pollInterval?: number,
+  dequeueInterval?: number,
   maxRetryCount?: number,
-  dequeueTimeout?: number,
+  messageTimeout?: number,
   instanceId?: string,
   logLevel?: 'INFO' | 'ERROR',
   logger?: Logger
@@ -53,17 +53,19 @@ export const setupPGQueue = () => `
 
 export const teardownPGQueue = () => 'DROP TABLE messages; DROP TABLE dead_messages'
 
-export const enqueue = <Body>(messages: Body[], partition: number) => {
-  return `INSERT INTO messages (partition, body) VALUES ${messages.map((message) => `(${partition}, '${JSON.stringify(message)}')`).join(', ')}`
-}
+export const enqueue = <Body>(messages: Body[], partition: number) => `
+  INSERT INTO messages (partition, body) VALUES ${messages.map((message) => `(${partition}, '${JSON.stringify(message)}')`).join(', ')};
+  NOTIFY enqueue, '${partition}';
+`
 
 const _dequeue = async <Body>(handler: Handler<Body>, client: ClientBase, _config: Required<Config>): Promise<void> => {
   let message: Message<Body> | undefined
+  const dequeueInterval = _config.dequeueInterval + ((Math.random() - 0.5) * 0.5 * _config.dequeueInterval)
 
   // dequeue message
   try {
-    await client.query('SET idle_in_transaction_session_timeout=' + _config.dequeueTimeout)
-    await client.query('SET idle_session_timeout=' + _config.dequeueTimeout)
+    await client.query('SET idle_in_transaction_session_timeout=' + _config.messageTimeout)
+    await client.query('SET idle_session_timeout=' + (dequeueInterval + 1000))
     await client.query('BEGIN')
     message = (await client.query<Message<Body>>(`
       WITH RECURSIVE partitions AS (
@@ -94,7 +96,8 @@ const _dequeue = async <Body>(handler: Handler<Body>, client: ClientBase, _confi
     `)).rows[0]
     if (message === undefined) {
       await client.query('COMMIT')
-      return await sleep(_config.pollInterval + ((Math.random() - 0.5) * 0.5 * _config.pollInterval))
+      await client.query('LISTEN enqueue')
+      return await asyncEvent(client, 'notification', ({ channel }: Notification) => channel === 'enqueue', dequeueInterval)
     }
   } catch (error) {
     _config.logger.error('dequeue_message_error', error, undefined, _config.instanceId)
@@ -136,9 +139,9 @@ const _dequeue = async <Body>(handler: Handler<Body>, client: ClientBase, _confi
 export const Queue = <Body>(handler: Handler<Body>, config: Config): () => Promise<void> => {
   const _config: Required<Config> = {
     pool: config.pool,
-    pollInterval: config.pollInterval ?? 2_000,               // 2s
+    dequeueInterval: config.dequeueInterval ?? 30_000,              // 30s
     errorRetryInterval: config.errorRetryInterval ?? 2_000,   // 2s
-    dequeueTimeout: config.dequeueTimeout ?? 60_000,          // 1min
+    messageTimeout: config.messageTimeout ?? 60_000,          // 1min
     maxRetryCount: config.maxRetryCount ?? 15,
     instanceId: config.instanceId ?? '1',
     logLevel: config.logLevel ?? 'ERROR',

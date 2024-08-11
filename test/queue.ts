@@ -223,7 +223,7 @@ test('retries failed messages with exponential backoff', async (t) => {
       createdAt = +message.created_at
       processedAt = Date.now()
     },
-    { pool, errorRetryInterval: 50, pollInterval: 50, maxRetryCount: 6 }
+    { pool, errorRetryInterval: 50, dequeueInterval: 50, maxRetryCount: 6 }
   )
 
   await pool.query(enqueue([{}], 1))
@@ -300,7 +300,7 @@ test('handles persistent message processing errors, sending messages to the dead
         aliveMessages.push(message.body)
       }
     },
-    { pool, errorRetryInterval: 10, pollInterval: 10, maxRetryCount: 5 }
+    { pool, errorRetryInterval: 10, dequeueInterval: 10, maxRetryCount: 5 }
   )
 
   await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 100, 100)
@@ -351,7 +351,7 @@ test('handles processing timeouts', async (t) => {
         messages.push(message)
       }
     },
-    { pool, dequeueTimeout: 500, pollInterval: 100, errorRetryInterval: 500 }
+    { pool, messageTimeout: 500, errorRetryInterval: 500 }
   )
 
   await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 1000, 10)
@@ -409,16 +409,16 @@ test('handles high throughput async message processing without dropping messages
     )
   })
 
+  const t1 = Date.now()
   for (let i = 0; i < 10; i++) {
     const messages = Array.from({ length: 500 }).map(() => ({ event: 'abc' }))
     expectedMessages.push(...messages.map(({ event }) => ({ partition: i, event })))
     await pool.query(enqueue(messages, i))
-    await sleep(Math.random() * 100)
+    await sleep(Math.random() * 50)
   }
 
-  const t0 = Date.now()
   await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 100, 500)
-  console.log(`Message Count: ${actualMessages.length}, Elapsed Time: ${Date.now() - t0}ms`)
+  console.log(`Processed ${actualMessages.length} messages. Elapsed Time: ${Date.now() - t1}ms`)
   await Promise.all(queues.map((teardown) => teardown()))
 
   t.deepEquals(

@@ -62,3 +62,18 @@ export const sortFlatObjectList = (list: Record<string, string | number>[]) => {
     return 0
   })
 }
+
+export const asyncEvent = <Arguments extends unknown[]>(emitter: NodeJS.EventEmitter, event: string, predicate: (...args: Arguments) => boolean, timeout: number): Promise<void> => {
+  return new Promise((resolve) => {
+    const handler = (...args: Arguments) => {
+      if (predicate(...args)) {
+        resolve()
+      }
+    }
+    emitter.once(event, handler)
+    setTimeout(() => {
+      emitter.off(event, handler)
+      resolve()
+    }, timeout)
+  })
+}

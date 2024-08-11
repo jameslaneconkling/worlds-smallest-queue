@@ -28,7 +28,7 @@ import { enqueue, Queue } from 'worlds-smallest-queue'
  */
 const pool = new Pool()
 const QUEUE_INSTANCE_COUNT = 10
-const CONFIG = { pool, dequeueTimeout: 60000, errorRetryInterval: 2000, maxRetryCount: 10 }
+const CONFIG = { pool, messageTimeout: 60000, errorRetryInterval: 2000, maxRetryCount: 10 }
 
 for (let i = 0; i < QUEUE_INSTANCE_COUNT; i++) {
   Queue(
@@ -138,14 +138,14 @@ Queue configuration
 type Config = {
   // [required] a pg Pool instance.
   pool: Pool
-  // [default: 2_000ms] ms poll interval when queue is empty.
-  pollInterval: number
-  // [default: 2_000ms] ms retry interval after a failed message. if a message fails multiple times, each subsequent retry interval doubles.
-  errorRetryInterval: number
   // [default: 60_000ms] ms timeout to dequeue and process a message. messages that timeout fail and are re-enqueued.
-  dequeueTimeout: number
+  messageTimeout: number
   // [default: 15] number of times to retry a message before adding it to the `dead_messages` table.
   maxRetryCount: number
+  // [default: 2_000ms] ms retry interval after a failed message. if a message fails multiple times, each subsequent retry interval doubles.
+  errorRetryInterval: number
+  // [default: 30_000ms] ms interval to wait for new messages in the queue.
+  dequeueInterval: number
   // [optional] queue instance id. used for error logging when there are multiple queues.
   instanceId: string
   // [default: 'ERROR'] whether to log all logs or only error logs.
