@@ -5,11 +5,11 @@ A stupid-simple Postgres-backed queue for Typescript
 - **messages partitioning**: balance message throughput across each partition. efficiently expose all messages or message count per partition.
 - **scalable enqueueing**: reliably enqueue bulk messages transactionally
 - **lightweight management**: minimize operational overhead
-- **minimal surface area**: under 200 LOC, minimal dependencies (postgres has already [done all the work](https://www.2ndquadrant.com/en/blog/what-is-select-skip-locked-for-in-postgresql-9-5/))
+- **minimal surface area**: under 200 LOC, minimal dependencies (postgres has already [done all](https://www.postgresql.org/docs/current/sql-notify.html) [the work](https://www.2ndquadrant.com/en/blog/what-is-select-skip-locked-for-in-postgresql-9-5/))
 
 
 ## Non-Goal
-- **maximize message throughput or minimize latency**: this library is intended for situations where the queue is fronting expensive business logic like a complex query to a resource-constrained system. the queue can handle significant message spikes and effectively rate limit message processing, but is not intended for scenarios where queue throughput itself is the main bottleneck. that said, this library _is_ fast, because Postgres is fast, and is capable of processing thousands of messages per second.
+- **maximize message throughput or minimize latency**: this library is intended for situations where the queue is fronting expensive business logic like a complex query to a resource-constrained system. the queue can handle significant message spikes and effectively rate limit message processing, but is not intended for scenarios where queue throughput itself is the main bottleneck. that said, the queue _is_ fast, because Postgres is fast: messages have millisecond latency and throughputs of thousands of messages per second.
 
 
 ## Terminology

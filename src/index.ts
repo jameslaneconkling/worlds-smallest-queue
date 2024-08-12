@@ -64,8 +64,8 @@ const _dequeue = async <Body>(handler: Handler<Body>, client: ClientBase, _confi
 
   // dequeue message
   try {
-    await client.query('SET idle_in_transaction_session_timeout=' + _config.messageTimeout)
-    await client.query('SET idle_session_timeout=' + (dequeueInterval + 1000))
+    await client.query(`SET idle_in_transaction_session_timeout=${_config.messageTimeout}`)
+    // await client.query(`SET idle_session_timeout=${dequeueInterval + 2000}`)
     await client.query('BEGIN')
     message = (await client.query<Message<Body>>(`
       WITH RECURSIVE partitions AS (
@@ -96,8 +96,12 @@ const _dequeue = async <Body>(handler: Handler<Body>, client: ClientBase, _confi
     `)).rows[0]
     if (message === undefined) {
       await client.query('COMMIT')
-      await client.query('LISTEN enqueue')
-      return await asyncEvent(client, 'notification', ({ channel }: Notification) => channel === 'enqueue', dequeueInterval)
+      if (dequeueInterval === 0) {
+        return sleep(2000)
+      } else {
+        await client.query('LISTEN enqueue')
+        return await asyncEvent(client, 'notification', ({ channel }: Notification) => channel === 'enqueue', dequeueInterval)
+      }
     }
   } catch (error) {
     _config.logger.error('dequeue_message_error', error, undefined, _config.instanceId)
@@ -112,7 +116,10 @@ const _dequeue = async <Body>(handler: Handler<Body>, client: ClientBase, _confi
     await client.query('COMMIT')
   } catch (error) {
     try {
-      if (message.retry_count < _config.maxRetryCount) {
+      if (error instanceof Error && error.message === 'Client has encountered a connection error and is not queryable') {
+        _config.logger.error('message_failure_connection_error', error, message, _config.instanceId)
+        await sleep(_config.errorRetryInterval)
+      } else if (message.retry_count < _config.maxRetryCount) {
         _config.logger.error('message_failure', error, message, _config.instanceId)
         await client.query('ROLLBACK')
         await client.query(`
@@ -139,10 +146,10 @@ const _dequeue = async <Body>(handler: Handler<Body>, client: ClientBase, _confi
 export const Queue = <Body>(handler: Handler<Body>, config: Config): () => Promise<void> => {
   const _config: Required<Config> = {
     pool: config.pool,
-    dequeueInterval: config.dequeueInterval ?? 30_000,              // 30s
-    errorRetryInterval: config.errorRetryInterval ?? 2_000,   // 2s
-    messageTimeout: config.messageTimeout ?? 60_000,          // 1min
+    messageTimeout: config.messageTimeout ?? 60_000,
     maxRetryCount: config.maxRetryCount ?? 15,
+    errorRetryInterval: config.errorRetryInterval ?? 2_000,
+    dequeueInterval: config.dequeueInterval ?? 30_000,
     instanceId: config.instanceId ?? '1',
     logLevel: config.logLevel ?? 'ERROR',
     logger: config.logger ?? createLogger(config.logLevel ?? 'ERROR')
