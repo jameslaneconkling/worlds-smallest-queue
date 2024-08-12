@@ -79,7 +79,7 @@ test('dequeues messages', async (t) => {
     async (message: Message<{ event: string }>) => {
       messages.push({ partition: message.partition, event: message.body.event })
     },
-    { pool }
+    { pool, dequeueInterval: 1000 }
   )
 
   await pool.query(enqueue([{ event: 'ghi' }, { event: 'def' }], 2))
@@ -118,7 +118,7 @@ test('handles async message processing', async (t) => {
       await sleep(100)
       messages.push({ partition: message.partition, event: message.body.event })
     },
-    { pool }
+    { pool, dequeueInterval: 1000 }
   )
 
   await pool.query(enqueue([{ event: 'ghi' }, { event: 'def' }], 2))
@@ -154,7 +154,7 @@ test('distributes work across multiple concurrent messengers', async (t) => {
         await sleep(10)
         expectedQueueInstanceMessageCount[i]++
       },
-      { pool, instanceId: `${i}` }
+      { pool, dequeueInterval: 1000, instanceId: `${i}` }
     )
   })
 
@@ -197,7 +197,7 @@ test('distributes work across partitions', async (t) => {
         partitions.add(partition)
       }
     },
-    { pool }
+    { pool, dequeueInterval: 1000 }
   )
 
   await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 100, 40)
@@ -212,7 +212,8 @@ test('retries failed messages with exponential backoff', async (t) => {
   let retryCount = 0
   let createdAt: number | undefined
   let processedAt: number | undefined
-  const retryTime = (50 * (2**0)) + (50 * (2**1)) + (50 * (2**2)) + (50 * (2**3)) + (50 * (2**4)) + (50 * (2**5))
+  const retryInterval = 50
+  const retryTime = (retryInterval * (2**0)) + (retryInterval * (2**1)) + (retryInterval * (2**2)) + (retryInterval * (2**3)) + (retryInterval * (2**4)) + (retryInterval * (2**5))
 
   const teardown = Queue(
     async (message) => {
@@ -223,7 +224,7 @@ test('retries failed messages with exponential backoff', async (t) => {
       createdAt = +message.created_at
       processedAt = Date.now()
     },
-    { pool, errorRetryInterval: 50, dequeueInterval: 50, maxRetryCount: 6 }
+    { pool, dequeueInterval: 25, errorRetryInterval: retryInterval, maxRetryCount: 6 }
   )
 
   await pool.query(enqueue([{}], 1))
@@ -253,7 +254,7 @@ test('handles temporary message processing errors', async (t) => {
         }
         messages.push({ partition: message.partition, event: message.body.event })
       },
-      { pool, instanceId: `${i}`, errorRetryInterval: 100 }
+      { pool, dequeueInterval: 1000, errorRetryInterval: 100, instanceId: `${i}` }
     )
   })
 
@@ -300,7 +301,7 @@ test('handles persistent message processing errors, sending messages to the dead
         aliveMessages.push(message.body)
       }
     },
-    { pool, errorRetryInterval: 10, dequeueInterval: 10, maxRetryCount: 5 }
+    { pool, dequeueInterval: 1000, errorRetryInterval: 10, maxRetryCount: 5 }
   )
 
   await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 100, 100)
@@ -320,7 +321,7 @@ test('handles network connection failure', async (t) => {
   const brokenPool = new pg.Pool({ user: 'broken', database: 'broken', password: 'broken', port: 0 })
   const teardownBrokenQueue = Queue(
     async () => {},
-    { pool: brokenPool }
+    { pool: brokenPool, dequeueInterval: 1000 }
   )
 
   await teardownBrokenQueue()
@@ -336,7 +337,7 @@ test('handles temporary network partition from PG', async (t) => {
 })
 
 
-test('handles processing timeouts', async (t) => {
+test('handles processing transaction timeouts', async (t) => {
   t.plan(1)
   
   let i = 0
@@ -345,13 +346,13 @@ test('handles processing timeouts', async (t) => {
 
   const teardown = Queue(
     async (message: Message<{ event: string }>) => {
-      if (i++ < 2) {
+      if (i++ === 1) {
         await sleep(1000)
       } else {
         messages.push(message)
       }
     },
-    { pool, messageTimeout: 500, errorRetryInterval: 500 }
+    { pool, dequeueInterval: 1000, messageTimeout: 500, errorRetryInterval: 500 }
   )
 
   await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 1000, 10)
@@ -359,6 +360,31 @@ test('handles processing timeouts', async (t) => {
 
   t.deepEquals(messages.map(({ body }) => body), [{ event: 'abc' }, { event: 'def' }], 'processed 2 messages after timeouts')
 })
+
+
+test('detect new messages on the queue within the polling interval', async (t) => {
+  t.plan(1)
+
+  const dequeueTimes: number[] = []
+  const teardown = Queue(
+    async (message: Message) => {
+      const dequeueTime = Date.now() - +message.created_at
+      console.log(`message dequeue time of ${dequeueTime}ms`)
+      dequeueTimes.push(dequeueTime)
+    },
+    { pool, dequeueInterval: 1000 }
+  )
+
+  for (let i = 0; i < 10; i++) {
+    await pool.query(enqueue([{}], 1))
+    await sleep(50)
+  }
+  await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 50, 10)
+  await teardown()
+  const averageDequeueTime = dequeueTimes.reduce((a, b) => a + b, 0) / dequeueTimes.length
+  t.ok(averageDequeueTime < 1000, `average message dequeue time of ${averageDequeueTime}ms is less than 1s`)
+})
+
 
 
 test('handles high throughput sync message processing without dropping messages', async (t) => {
@@ -377,7 +403,7 @@ test('handles high throughput sync message processing without dropping messages'
       async (message: Message<{ event: string }>) => {
         actualMessages.push({ partition: message.partition, event: message.body.event })
       },
-      { pool, instanceId: `${i}` }
+      { pool, dequeueInterval: 1000, instanceId: `${i}` }
     )
   })
 
@@ -393,7 +419,6 @@ test('handles high throughput sync message processing without dropping messages'
   )
 })
 
-
 test('handles high throughput async message processing without dropping messages', async (t) => {
   t.plan(1)
   const expectedMessages: { partition: number, event: string }[] = []
@@ -405,7 +430,7 @@ test('handles high throughput async message processing without dropping messages
         await sleep(Math.random() * 50)
         actualMessages.push({ partition: message.partition, event: message.body.event })
       },
-      { pool, instanceId: `${i}` }
+      { pool, dequeueInterval: 1000, instanceId: `${i}` }
     )
   })
 
