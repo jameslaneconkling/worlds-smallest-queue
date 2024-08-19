@@ -45,7 +45,15 @@ for (let i = 0; i < QUEUE_INSTANCE_COUNT; i++) {
  */
 const messages = [{ event: 'abc' }, { event: 'def' }, { event: 'abc' }]
 const partition = 1
-await pool.query(enqueue(messages, partition))
+let client: PoolClient | undefined
+try {
+  client = await pool.connect()
+  await enqueue(client, messages, partition)
+} catch (error) {
+  console.error(error)
+} finally {
+  client?.release()
+}
 ```
 
 ## Installation
@@ -87,9 +95,9 @@ for (let i = 0; i < 10; i++) {
 If message processing is CPU bound, distribute the queue instances across multiple Node workers or multiple machines.
 
 ### enqueue
-`enqueue(messages: Message<Body>[], partition: number) => string`
+`enqueue(client: ClientBase, messages: Message<Body>[], partition: number, awaitMessage?: number) => Promise<number[]>`
 
-Return a SQL query string to enqueue messages to a single partition.
+Enqueue messages to partition. Returns message ids.
 
 ```ts
 import { Pool } from 'pg'
@@ -99,13 +107,43 @@ const pool = new Pool()
 const messages = [{ work: 'it' }, { work: 'it' }]
 const partitions = 1
 
-await pool.query(enqueue(messages, partition))
+let client: PoolClient | undefined
+try {
+  client = await pool.connect()
+  await enqueue(client, messages, partition)
+} catch (error) {
+  console.error(error)
+} finally {
+  client?.release()
+}
+```
+
+If 4th optional `awaitMessage` argument is passed, waits for up to `awaitMessage` ms for all messages to be processed successfully. If the queue partition is backed up, or messages are processed slowly, or repeated errors slow or fail message processing, enqueue promise is more likely to resolve b/c of the `awaitMessage` timeout. But if the partition is empty or mostly empty, messages are processed quickly, and there are no errors, then awaiting enqueue functions with the `awaitMessage` argument will allow clients to know when messages have succeeded.
+
+```ts
+import { Pool } from 'pg'
+import { enqueue } from 'worlds-smallest-queue'
+
+const pool = new Pool()
+const messages = [{ work: 'it' }, { work: 'it' }]
+const partitions = 1
+
+let client: PoolClient | undefined
+try {
+  client = await pool.connect()
+  await enqueue(client, messages, partition, 10_000)
+  console.log()
+} catch (error) {
+  console.error(error)
+} finally {
+  client?.release()
+}
 ```
 
 ### setupPGQueue
 `setupPGQueue() => string`
 
-Return a SQL query string to set up the queue tables. The queue schema is trivial, so you can also create the tables by hand via any schema migration tool.
+Return a SQL query string to set up the queue tables. The queue schema is trivial so you can also create the tables by hand via any schema migration tool.
 
 ```ts
 import { Pool } from 'pg'

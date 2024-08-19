@@ -1,7 +1,9 @@
 import test from 'tape'
 import pg from 'pg'
-import { enqueue, Message, Queue, setupPGQueue } from '../src/index.js'
+import { enqueue, Queue, setupPGQueue } from '../src/index.js'
 import { poll, sleep, sortFlatObjectList as sort } from '../src/utils.js'
+import { Message } from '../src/types.js'
+
 
 if (process.env.PG_PORT === undefined) {
   console.error('missing PG_PORT env variable')
@@ -11,45 +13,47 @@ if (process.env.PG_PORT === undefined) {
   process.exit(1)
 }
 
-const PG_CONFIG = {
+
+const pool = new pg.Pool({
   user: 'postgres',
   database: 'worlds-smallest-queue-test',
   password: 'test',
   port: parseInt(process.env.PG_PORT!, 10),
   max: 25,
-}
+})
 
 
-/**
- * Setup
- */
-const pool = new pg.Pool(PG_CONFIG)
+test('setup queue tests', async (t) => {
+  t.plan(1)
 
-try {
-  await pool.query('DROP TABLE messages')
-} catch (error) {
-  if (error !== null && typeof error === 'object' && 'routine' in error && error.routine !== 'DropErrorMsgNonExistent') {
-    console.error(error)
+  try {
+    await pool.query('DROP TABLE messages')
+  } catch (error) {
+    if (error !== null && typeof error === 'object' && 'routine' in error && error.routine !== 'DropErrorMsgNonExistent') {
+      console.error(error)
+    }
   }
-}
-try {
-  await pool.query('DROP TABLE dead_messages')
-} catch (error) {
-  if (error !== null && typeof error === 'object' && 'routine' in error && error.routine !== 'DropErrorMsgNonExistent') {
-    console.error(error)
+  try {
+    await pool.query('DROP TABLE dead_messages')
+  } catch (error) {
+    if (error !== null && typeof error === 'object' && 'routine' in error && error.routine !== 'DropErrorMsgNonExistent') {
+      console.error(error)
+    }
   }
-}
+  
+  await pool.query(setupPGQueue())
 
-await pool.query(setupPGQueue())
+  t.pass('setup complete')
+})
 
 
-/**
- * Tests
-*/
 test('enqueues messages', async (t) => {
   t.plan(1)
-  await pool.query(enqueue([{ event: 'abc', count: 1, vip: true }, { event: 'def', count: 1, vip: true }, { event: 'abc', count: 1, vip: true }], 1))
-  await pool.query(enqueue([{ event: 'ghi', count: 1, vip: true }, { event: 'def', count: 1, vip: true }], 2))
+
+  const client = await pool.connect()
+  await enqueue(client, [{ event: 'abc', count: 1, vip: true }, { event: 'def', count: 1, vip: true }, { event: 'abc', count: 1, vip: true }], 1)
+  await enqueue(client, [{ event: 'ghi', count: 1, vip: true }, { event: 'def', count: 1, vip: true }], 2)
+  client.release()
 
   t.deepEquals(
     sort(
@@ -71,9 +75,11 @@ test('enqueues messages', async (t) => {
 
 test('dequeues messages', async (t) => {
   t.plan(2)
+
   const messages: { partition: number, event: string }[] = []
 
-  await pool.query(enqueue([{ event: 'abc' }, { event: 'def' }, { event: 'abc' }], 1))
+  const client = await pool.connect()
+  await enqueue(client, [{ event: 'abc' }, { event: 'def' }, { event: 'abc' }], 1)
 
   const teardown = Queue(
     async (message: Message<{ event: string }>) => {
@@ -82,7 +88,8 @@ test('dequeues messages', async (t) => {
     { pool, dequeueInterval: 1000 }
   )
 
-  await pool.query(enqueue([{ event: 'ghi' }, { event: 'def' }], 2))
+  await enqueue(client, [{ event: 'ghi' }, { event: 'def' }], 2)
+  client.release()
 
   await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 25, 40)
 
@@ -109,9 +116,11 @@ test('dequeues messages', async (t) => {
 
 test('handles async message processing', async (t) => {
   t.plan(1)
+
   const messages: { partition: number, event: string }[] = []
 
-  await pool.query(enqueue([{ event: 'abc' }, { event: 'def' }, { event: 'abc' }], 1))
+  const client = await pool.connect()
+  await enqueue(client, [{ event: 'abc' }, { event: 'def' }, { event: 'abc' }], 1)
 
   const teardown = Queue(
     async (message: Message<{ event: string }>) => {
@@ -121,7 +130,8 @@ test('handles async message processing', async (t) => {
     { pool, dequeueInterval: 1000 }
   )
 
-  await pool.query(enqueue([{ event: 'ghi' }, { event: 'def' }], 2))
+  await enqueue(client, [{ event: 'ghi' }, { event: 'def' }], 2)
+  client.release()
   await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 25, 40)
   await teardown()
 
@@ -141,11 +151,13 @@ test('handles async message processing', async (t) => {
 
 test('distributes work across multiple concurrent messengers', async (t) => {
   t.plan(6)
+
   const expectedMessageCount = 250
   const expectedQueueInstanceMessageCount: Record<number, number> = {}
 
-  await pool.query(enqueue(Array.from({ length: 50 }).map(() => ({ event: 'abc' })), 1))
-  await pool.query(enqueue(Array.from({ length: 50 }).map(() => ({ event: 'def' })), 2))
+  const client = await pool.connect()
+  await enqueue(client, Array.from({ length: 50 }).map(() => ({ event: 'abc' })), 1)
+  await enqueue(client, Array.from({ length: 50 }).map(() => ({ event: 'def' })), 2)
 
   const queues = Array.from({ length: 5 }).map((_, i) => {
     expectedQueueInstanceMessageCount[i] = 0
@@ -159,11 +171,12 @@ test('distributes work across multiple concurrent messengers', async (t) => {
   })
 
   await sleep(10)
-  await pool.query(enqueue(Array.from({ length: 50 }).map(() => ({ event: 'ghi' })), 3))
+  await enqueue(client, Array.from({ length: 50 }).map(() => ({ event: 'ghi' })), 3)
   await sleep(10)
-  await pool.query(enqueue(Array.from({ length: 50 }).map(() => ({ event: 'def' })), 1))
+  await enqueue(client, Array.from({ length: 50 }).map(() => ({ event: 'def' })), 1)
   await sleep(10)
-  await pool.query(enqueue(Array.from({ length: 50 }).map(() => ({ event: 'abc' })), 4))
+  await enqueue(client, Array.from({ length: 50 }).map(() => ({ event: 'abc' })), 4)
+  client.release()
 
   await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 100, 100)
   await Promise.all(queues.map((teardown) => teardown()))
@@ -182,14 +195,17 @@ test('distributes work across multiple concurrent messengers', async (t) => {
 
 test('distributes work across partitions', async (t) => {
   t.plan(1)
-  
+
   let i = 0
   const partitions = new Set<number>()
-  await pool.query(enqueue(Array.from({ length: 100 }).map(() => ({})), 1))
-  await pool.query(enqueue(Array.from({ length: 100 }).map(() => ({})), 2))
-  await pool.query(enqueue(Array.from({ length: 100 }).map(() => ({})), 3))
-  await pool.query(enqueue(Array.from({ length: 100 }).map(() => ({})), 4))
-  await pool.query(enqueue(Array.from({ length: 100 }).map(() => ({})), 5))
+
+  const client = await pool.connect()
+  await enqueue(client, Array.from({ length: 100 }).map(() => ({})), 1)
+  await enqueue(client, Array.from({ length: 100 }).map(() => ({})), 2)
+  await enqueue(client, Array.from({ length: 100 }).map(() => ({})), 3)
+  await enqueue(client, Array.from({ length: 100 }).map(() => ({})), 4)
+  await enqueue(client, Array.from({ length: 100 }).map(() => ({})), 5)
+  client.release()
 
   const teardown = Queue(
     async ({ partition }: Message) => {
@@ -227,7 +243,9 @@ test('retries failed messages with exponential backoff', async (t) => {
     { pool, dequeueInterval: 25, errorRetryInterval: retryInterval, maxRetryCount: 6 }
   )
 
-  await pool.query(enqueue([{}], 1))
+  const client = await pool.connect()
+  await enqueue(client, [{}], 1)
+  client.release()
   await sleep(retryTime)
   await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 100, 100)
   await teardown()
@@ -241,9 +259,11 @@ test('retries failed messages with exponential backoff', async (t) => {
 
 test('handles temporary message processing errors', async (t) => {
   t.plan(1)
+
   const messages: { partition: number, event: string }[] = []
 
-  await pool.query(enqueue([{ event: 'abc' }, { event: 'def' }, { event: 'abc' }], 1))
+  const client = await pool.connect()
+  enqueue(client, [{ event: 'abc' }, { event: 'def' }, { event: 'abc' }], 1)
 
   const queues = Array.from({ length: 2 }).map((_, i) => {
     return Queue(
@@ -258,11 +278,12 @@ test('handles temporary message processing errors', async (t) => {
     )
   })
 
-  await pool.query(enqueue([{ event: 'ghi' }, { event: 'def' }, { event: 'abc' }], 2))
+  await enqueue(client, [{ event: 'ghi' }, { event: 'def' }, { event: 'abc' }], 2)
   await sleep(20)
-  await pool.query(enqueue([{ event: 'abc' }, { event: 'def' }, { event: 'abc' }], 3))
+  await enqueue(client, [{ event: 'abc' }, { event: 'def' }, { event: 'abc' }], 3)
   await sleep(60)
-  await pool.query(enqueue([{ event: 'abc' }, { event: 'def' }, { event: 'ghi' }], 1))
+  await enqueue(client, [{ event: 'abc' }, { event: 'def' }, { event: 'ghi' }], 1)
+  client.release()
   await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 100, 400)
   await Promise.all(queues.map((teardown) => teardown()))
 
@@ -291,7 +312,9 @@ test('handles persistent message processing errors, sending messages to the dead
   t.plan(3)
 
   const aliveMessages: { event: string }[] = []
-  await pool.query(enqueue([{ event: 'abc' }, { event: 'def' }, { event: 'abc' }], 1))
+  const client = await pool.connect()
+  await enqueue(client, [{ event: 'abc' }, { event: 'def' }, { event: 'abc' }], 1)
+  client.release()
 
   const teardown = Queue(
     async (message: Message<{ event: string }>) => {
@@ -316,7 +339,10 @@ test('handles persistent message processing errors, sending messages to the dead
 
 test('handles network connection failure', async (t) => {
   t.plan(1)
-  await pool.query(enqueue([{ event: 'abc' }, { event: 'def' }], 1))
+
+  const client = await pool.connect()
+  await enqueue(client, [{ event: 'abc' }, { event: 'def' }], 1)
+  client.release()
 
   const brokenPool = new pg.Pool({ user: 'broken', database: 'broken', password: 'broken', port: 0 })
   const teardownBrokenQueue = Queue(
@@ -333,16 +359,19 @@ test('handles network connection failure', async (t) => {
 
 test('handles temporary network partition from PG', async (t) => {
   t.plan(1)
+
   t.ok('yup', 'TODO')
 })
 
 
 test('handles processing transaction timeouts', async (t) => {
   t.plan(1)
-  
+
   let i = 0
   const messages: Message<{ event: string }>[] = []
-  await pool.query(enqueue([{ event: 'abc' }, { event: 'def' }], 1))
+  const client = await pool.connect()
+  await enqueue(client, [{ event: 'abc' }, { event: 'def' }], 1)
+  client.release()
 
   const teardown = Queue(
     async (message: Message<{ event: string }>) => {
@@ -375,28 +404,98 @@ test('detect new messages on the queue within the polling interval', async (t) =
     { pool, dequeueInterval: 1000 }
   )
 
-  for (let i = 0; i < 10; i++) {
-    await pool.query(enqueue([{}], 1))
-    await sleep(50)
+  const client = await pool.connect()
+  for (let i = 0; i < 20; i++) {
+    await enqueue(client, [{}], 1)
+    await sleep(10)
   }
+  client.release()
   await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 50, 10)
   await teardown()
+
   const averageDequeueTime = dequeueTimes.reduce((a, b) => a + b, 0) / dequeueTimes.length
   t.ok(averageDequeueTime < 1000, `average message dequeue time of ${averageDequeueTime}ms is less than 1s`)
+})
+
+
+test('waits for queue to process awaited messages when enqueueing with awaitMessage argument', async (t) => {
+  t.plan(2)
+
+  const teardown = Queue(async () => sleep(10), { pool, dequeueInterval: 2000 })
+
+  const client = await pool.connect()
+  await enqueue(client, [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}], 1)
+  const t0 = Date.now()
+  const messageIds = await enqueue(client, [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}], 1, 1000)
+  const dt = Date.now() - t0
+  await enqueue(client, [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}], 1)
+  const messageCount = (await client.query<{ count: number }>('SELECT count(*)::int FROM messages WHERE id = ANY($1)', [messageIds])).rows[0].count
+  client.release()
+  await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 100, 20)
+  await teardown()
+
+  t.ok(dt < 1000, `time to dequeue awaited messages of ${dt}ms is less than under 1s`)
+  t.equals(messageCount, 0, 'waited for the queue to process all 15 messages')
+})
+
+
+test('times out waiting for queue to process awaited messages when message processing takes longer than awaitMessage', async (t) => {
+  t.plan(5)
+
+  const messageIds: number[] = []
+
+  const teardown = Queue(
+    async (message) => {
+      messageIds.push(message.id)
+      return sleep(200)
+    },
+    { pool, dequeueInterval: 2000 }
+  )
+
+  const client = await pool.connect()
+  await enqueue(client, [{}, {}, {}, {}], 1)
+  const t0 = Date.now()
+  const awaitedMessageIds = await enqueue(client, [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}], 1, 2000)
+  const dt = Date.now() - t0
+  const remainingMessageIds = (await client.query<{ id: number }>('SELECT id FROM messages WHERE id = ANY($1)', [awaitedMessageIds])).rows.map(({ id }) => id)
+  const processedMessageIds = messageIds.filter((id) => awaitedMessageIds.includes(id))
+  await enqueue(client, [{}, {}, {}], 1)
+  client.release()
+  await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 100, 20)
+  await teardown()
+
+  t.equals(awaitedMessageIds.length, 10, 'enqueued 10 messages')
+  t.ok(dt >= 2000 && dt < 2050, `awaited messages timed out in ${dt}ms`)
+  t.ok(
+    processedMessageIds.length > 0 && processedMessageIds.length < awaitedMessageIds.length,
+    `processed ${processedMessageIds.length} of ${awaitedMessageIds.length} messages`
+  )
+  t.ok(
+    remainingMessageIds.length > 0 && remainingMessageIds.length < awaitedMessageIds.length,
+    `timed out before processing remaining ${remainingMessageIds.length} of ${awaitedMessageIds.length} messages`
+  )
+  t.ok(
+    new Set([...processedMessageIds, ...remainingMessageIds]).size === awaitedMessageIds.length,
+    `processed message count ${processedMessageIds.length} plus remaining message count of ${remainingMessageIds.length} is equal to total message count of ${awaitedMessageIds.length}`
+  )
 })
 
 
 
 test('handles high throughput sync message processing without dropping messages', async (t) => {
   t.plan(1)
+
   const expectedMessages: { partition: number, event: string }[] = []
   const actualMessages: { partition: number, event: string }[] = []
 
   const messages = Array.from({ length: 20000 }).map(() => ({ event: 'abc' }))
   expectedMessages.push(...messages.map(({ event }) => ({ partition: 1, event })))
+  
+  const client = await pool.connect()
   const t0 = Date.now()
-  await pool.query(enqueue(messages, 1))
+  await enqueue(client, messages, 1)
   console.log(`Enqueued ${expectedMessages.length} messages. Elapsed Time: ${Date.now() - t0}ms`)
+  client.release()
 
   const queues = Array.from({ length: 20 }).map((_, i) => {
     return Queue(
@@ -421,6 +520,7 @@ test('handles high throughput sync message processing without dropping messages'
 
 test('handles high throughput async message processing without dropping messages', async (t) => {
   t.plan(1)
+
   const expectedMessages: { partition: number, event: string }[] = []
   const actualMessages: { partition: number, event: string }[] = []
 
@@ -434,13 +534,15 @@ test('handles high throughput async message processing without dropping messages
     )
   })
 
+  const client = await pool.connect()
   const t1 = Date.now()
   for (let i = 0; i < 10; i++) {
     const messages = Array.from({ length: 500 }).map(() => ({ event: 'abc' }))
     expectedMessages.push(...messages.map(({ event }) => ({ partition: i, event })))
-    await pool.query(enqueue(messages, i))
+    await enqueue(client, messages, i)
     await sleep(Math.random() * 50)
   }
+  client.release()
 
   await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 100, 500)
   console.log(`Processed ${actualMessages.length} messages. Elapsed Time: ${Date.now() - t1}ms`)
@@ -456,25 +558,29 @@ test('handles high throughput async message processing without dropping messages
 
 test('is not vulnerable to sql injection', async (t) => {
   t.plan(1)
-  const injection = enqueue([{ x: `1"}'); DROP TABLE messages --` }], 1)
 
+  const injection = [{ x: `1"}'); DROP TABLE messages --` }]
+  
+  const client = await pool.connect()
   try {
-    await pool.query(injection)
+    await enqueue(client, injection, 1)
   } catch (error) {
     if (error !== null && typeof error === 'object' && 'routine' in error && error.routine !== 'json_errsave_error') {
       console.error(error)
+    } else {
+      t.fail(error)
     }
   }
+  client.release()
 
   const messageTableExists = (await pool.query<{ exists: boolean }>('SELECT to_regclass(\'messages\') IS NOT NULL AS exists;')).rows[0].exists
   t.ok(messageTableExists, 'attempted sql injection does not succeed at dropping messages table')
 })
 
 
-/**
- * Teardown
- */
-test.onFinish(async () => {
+test('teardown queue test', async (t) => {
+  t.plan(1)
+
   try {
     await pool.query('DROP TABLE messages')
   } catch (error) {
@@ -488,5 +594,8 @@ test.onFinish(async () => {
     if (error !== null && typeof error === 'object' && 'routine' in error && error.routine !== 'DropErrorMsgNonExistent') {
       console.error(error)
     }
-  }  await pool.end()
+  }
+  await pool.end()
+
+  t.pass('teardown queue test complete')
 })

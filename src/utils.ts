@@ -1,4 +1,4 @@
-import type { Message, Logger } from './index.js'
+import type { Message, Logger } from './types.js'
 
 export const noop = () => {}
 
@@ -52,6 +52,7 @@ export const loop = (fn: () => Promise<void>) => {
 
 export const sortFlatObjectList = (list: Record<string, string | number>[]) => {
   const keys = Object.keys(list[0]).sort()
+
   return Array.from(list).sort((a, b) => {
     for (const key of keys) {
       if (a[key] !== b[key]) {
@@ -63,14 +64,17 @@ export const sortFlatObjectList = (list: Record<string, string | number>[]) => {
   })
 }
 
-export const asyncEvent = <Arguments extends unknown[]>(emitter: NodeJS.EventEmitter, event: string, predicate: (...args: Arguments) => boolean, timeout: number): Promise<void> => {
-  return new Promise((resolve) => {
+export const asyncEvent = <Arguments extends unknown[]>(emitter: NodeJS.EventEmitter, event: string, predicate: (...args: Arguments) => boolean, timeout: number) => {
+  return new Promise<void>((resolve) => {
     const handler = (...args: Arguments) => {
       if (predicate(...args)) {
+        emitter.off(event, handler)
         resolve()
       }
     }
-    emitter.once(event, handler)
+
+    emitter.on(event, handler)
+
     setTimeout(() => {
       emitter.off(event, handler)
       resolve()
