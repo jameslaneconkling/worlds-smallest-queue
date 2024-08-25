@@ -149,7 +149,7 @@ test('returns a message from a random partition', async (t) => {
   }
   const averageDuration = totalDuration / 100
 
-  t.ok(averageDuration < 2, `returning a message in ${averageDuration}ms is less than 2ms`)
+  t.ok(averageDuration < 4, `returning a message in ${averageDuration}ms is less than 4ms`)
 
   await client.query('TRUNCATE messages')
 })

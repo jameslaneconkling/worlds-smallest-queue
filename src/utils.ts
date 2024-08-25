@@ -1,83 +1,48 @@
-import type { Message, Logger } from './types.js'
-
-export const noop = () => {}
-
-const _info = (key: string, message?: Message, instanceId?: string) => (
-  console.log(`[${instanceId}] ${key} ${message === undefined ? '' : `id: ${message.id}, retry_count: ${message.retry_count}, elapsed_time: ${Date.now() - +message.created_at}`}`)
-)
-
-const _error = (key: string, error: unknown, message?: Message, instanceId?: string) => (
-  console.error(`[${instanceId}] ${key} ${message === undefined ? '' : `id: ${message.id}, retry_count: ${message.retry_count}, elapsed_time: ${Date.now() - +message.created_at}`}`, error)
-)
+import { type Message, type Logger, type CancellablePromise } from './types.js'
 
 export const createLogger = (level: 'INFO' | 'ERROR'): Logger => ({
-  info: level === 'INFO' ? _info : noop,
-  error: level === 'ERROR' || level === 'INFO' ? _error : noop
+  info: level === 'INFO' ? (key: string, message?: Message, instanceId?: string) => (
+    console.log(`[${instanceId}] ${key} ${message === undefined ? '' : `id: ${message.id}, retry_count: ${message.retry_count}, elapsed_time: ${Date.now() - +message.created_at}`}`)
+  ) : () => {},
+  error: level === 'ERROR' || level === 'INFO' ? (key: string, error: unknown, message?: Message, instanceId?: string) => (
+    console.error(`[${instanceId}] ${key} ${message === undefined ? '' : `id: ${message.id}, retry_count: ${message.retry_count}, elapsed_time: ${Date.now() - +message.created_at}`}`, error)
+  ) : () => {}
 })
 
-export const sleep = async (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+export const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
-export const poll = async (asyncPredicate: () => Promise<boolean>, pollInterval: number, maxRetry: number) => {
-  let retry = 0
-  while (true) {
-    if (retry++ >= maxRetry) {
-      throw new Error('poll_max_retry')
-    }
-    
-    try {
-      if (await asyncPredicate()) {
-        return
-      }
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    } catch (_) { /* empty */ }
-
-    await sleep(pollInterval)
-  }
-}
-
-export const loop = (fn: () => Promise<void>) => {
-  let looping = true
-
-  const loopComplete = (async () => {
-    while (looping) {
-      await fn()
-    }
-  })()
-
-  return async () => {
-    looping = false
-    await loopComplete
-  }
-}
-
-export const sortFlatObjectList = (list: Record<string, string | number>[]) => {
-  const keys = Object.keys(list[0]).sort()
-
-  return Array.from(list).sort((a, b) => {
-    for (const key of keys) {
-      if (a[key] !== b[key]) {
-        return a[key].toString().localeCompare(b[key].toString())
-      }
-    }
-
-    return 0
+export const timeout = (fn: () => Promise<void>, ms: number): Promise<void> => {
+  return new Promise<void>((resolve, reject) => {
+    const timeoutId = setTimeout(() => reject(new Error('timeout')), ms)
+    fn()
+      .then(() => { clearTimeout(timeoutId); resolve() })
+      .catch((error) => { clearTimeout(timeoutId); reject(error) })
   })
 }
 
-export const asyncEvent = <Arguments extends unknown[]>(emitter: NodeJS.EventEmitter, event: string, predicate: (...args: Arguments) => boolean, timeout: number) => {
-  return new Promise<void>((resolve) => {
+export const loop = (fn: () => Promise<void>): CancellablePromise<void> => {
+  let looping = true
+
+  const promise = (async () => {
+    while (looping) await fn()
+  })() as CancellablePromise<void>
+
+  promise.teardown = () => { looping = false; return promise }
+
+  return promise
+}
+
+export const awaitEvent = <Arguments extends unknown[]>(emitter: NodeJS.EventEmitter, event: string, predicate: (...args: Arguments) => boolean, ms: number) => {
+  return new Promise<boolean>((resolve) => {
     const handler = (...args: Arguments) => {
       if (predicate(...args)) {
         emitter.off(event, handler)
-        resolve()
+        resolve(true)
       }
     }
 
     emitter.on(event, handler)
 
-    setTimeout(() => {
-      emitter.off(event, handler)
-      resolve()
-    }, timeout)
+    setTimeout(() => { emitter.off(event, handler); resolve(false) }, ms)
   })
 }

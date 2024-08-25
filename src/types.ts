@@ -3,10 +3,13 @@ import { type Pool, type ClientBase } from 'pg'
 
 export type Config = {
   pool: Pool,
-  errorRetryInterval?: number,
-  dequeueInterval?: number,
-  maxRetryCount?: number,
   messageTimeout?: number,
+  maxMessageRetryCount?: number,
+  messageErrorRetryInterval?: number,
+  queueTimeout?: number,
+  maxQueueRetryCount?: number
+  queueErrorRetryInterval?: number,
+  dequeueInterval?: number,
   instanceId?: string,
   logLevel?: 'INFO' | 'ERROR',
   logger?: Logger
@@ -23,6 +26,8 @@ export type Message<Body = unknown> = {
 }
 
 export type Handler<Body> = (message: Message<Body>, client: ClientBase) => Promise<unknown>
+
+export type CancellablePromise<T> = Promise<T> & { teardown: () => Promise<T> }
 
 export type Logger = {
   info: (key: string, message?: Message, instanceId?: string) => void
