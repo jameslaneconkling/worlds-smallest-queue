@@ -1,8 +1,9 @@
 import { type ClientBase, type PoolClient, type Notification } from 'pg'
-import { createLogger, loop, awaitEvent, sleep, timeout } from './utils.js'
+import { createLogger, loop, awaitEvent, sleep, escapeIdentifier } from './utils.js'
 import { type Config, type Message, type Handler, type Logger, type CancellablePromise } from './types.js'
 
-export const setupPGQueue = () => `
+export const setupPGQueue = (schema = 'public') => `
+  SET search_path TO ${escapeIdentifier(schema)};
   CREATE TABLE messages (
     id bigserial NOT NULL,
     partition integer NOT NULL,
@@ -25,19 +26,21 @@ export const setupPGQueue = () => `
   );
 `
 
-export const teardownPGQueue = () => 'DROP TABLE messages; DROP TABLE dead_messages'
+export const teardownPGQueue = (schema = 'public') => `SET search_path TO ${escapeIdentifier(schema)}; DROP TABLE messages; DROP TABLE dead_messages;`
 
-export const enqueue = async <Body>(client: ClientBase, messages: Body[], partition: number, awaitMessage?: number): Promise<{ ids: number[], awaited?: boolean }> => {
-  const values = messages.map((message) => `(${partition}, '${JSON.stringify(message)}', ${awaitMessage !== undefined})`).join(', ')
-  const messageIds = (await client.query<{ id: number }>(`INSERT INTO messages (partition, body, await) VALUES ${values} RETURNING (id)`)).rows
+export const enqueue = async <Body>(client: ClientBase, messages: Body[], partition: number, options?: { awaitMessage?: number, schema?: string }): Promise<{ ids: number[], awaited?: boolean }> => {
+  await client.query(`SET search_path TO ${escapeIdentifier(options?.schema ?? 'public')}`)
+  const messageIds = (await client.query<{ id: number }>(`
+    INSERT INTO messages (partition, body, await) VALUES ${messages.map((_, idx) => `(${Number(partition)}, $${idx + 1}, ${options?.awaitMessage !== undefined})`).join()} RETURNING (id)
+  `, messages)).rows
   let awaited: boolean | undefined
-  await client.query(`NOTIFY enqueue, '${partition}'`)
+  await client.query(`NOTIFY enqueue, '${Number(partition)}'`)
 
-  if (awaitMessage) {
+  if (options?.awaitMessage !== undefined) {
     client.setMaxListeners(client.getMaxListeners() + messageIds.length)
     await client.query('LISTEN dequeue')
     awaited = (await Promise.all(messageIds.map(({ id }) => (
-      awaitEvent(client, 'notification', ({ channel, payload }: Notification) => channel === 'dequeue' && payload === `${partition}_${id}`, awaitMessage)
+      awaitEvent(client, 'notification', ({ channel, payload }: Notification) => channel === 'dequeue' && payload === `${partition}_${id}`, options?.awaitMessage as number)
     )))).every((awaitSuccessful) => awaitSuccessful)
     client.setMaxListeners(client.getMaxListeners() - messageIds.length)
   }
@@ -47,8 +50,7 @@ export const enqueue = async <Body>(client: ClientBase, messages: Body[], partit
 
 const dequeue = async <Body>(client: ClientBase, handler: Handler<Body>, config: Required<Config>): Promise<void> => {
   // dequeue message
-  await client.query(`SET idle_in_transaction_session_timeout=${config.messageTimeout}`)
-  await client.query('BEGIN')
+  await client.query(`SET idle_in_transaction_session_timeout=${Number(config.messageTimeout)}; SET search_path TO ${escapeIdentifier(config.schema)}; BEGIN;`)
   const message = (await client.query<Message<Body>>(`
     WITH RECURSIVE partitions (partition) AS (
       (SELECT partition FROM messages ORDER BY partition LIMIT 1)
@@ -67,8 +69,7 @@ const dequeue = async <Body>(client: ClientBase, handler: Handler<Body>, config:
   `)).rows[0]
 
   if (message === undefined) {
-    await client.query('COMMIT')
-    await client.query('LISTEN enqueue')
+    await client.query('COMMIT; LISTEN enqueue;')
     await awaitEvent(client, 'notification' as const, ({ channel }) => channel === 'enqueue', config.dequeueInterval)
     return
   }
@@ -78,7 +79,7 @@ const dequeue = async <Body>(client: ClientBase, handler: Handler<Body>, config:
     config.logger.info('processing_message', message, config.instanceId)
     await handler(message, client)
     await client.query('COMMIT')
-    if (message.await) client.query(`NOTIFY dequeue, '${message.partition}_${message.id}'`)
+    if (message.await) await client.query(`NOTIFY dequeue, '${message.partition}_${message.id}'`)
   } catch (error) {
     if (message.retry_count < config.maxMessageRetryCount) {
       config.logger.error('message_failure', error, message, config.instanceId)
@@ -87,14 +88,13 @@ const dequeue = async <Body>(client: ClientBase, handler: Handler<Body>, config:
         UPDATE messages
         SET retry_at = NOW() + ($1 * (2 ^ retry_count)) * INTERVAL '1 ms', retry_count = retry_count + 1
         WHERE partition = $2 AND id = $3
-      `, [config.messageErrorRetryInterval, message.partition, message.id])
+      `, [config.errorRetryInterval, message.partition, message.id])
     } else {
       config.logger.error('message_failure_max_retry', error, message, config.instanceId)
-      client.query(`
+      await client.query(`
         INSERT INTO dead_messages (id, partition, body, retry_count, error, created_at) VALUES ($1, $2, $3, $4, $5, $6)
       `, [message.id, message.partition, message.body, message.retry_count, error, message.created_at])
       await client.query('COMMIT')
-      if (message.await) client.query(`NOTIFY dequeue_error, '${message.partition}_${message.id}'`)
     }
   }
 }
@@ -103,17 +103,11 @@ export const Queue = <Body>(handler: Handler<Body>, config: Config): Cancellable
   let errorCount = 0
   const _config: Required<Config> = {
     pool: config.pool,
+    schema: config.schema ?? 'public',
     messageTimeout: config.messageTimeout ?? 60_000,
     maxMessageRetryCount: config.maxMessageRetryCount ?? 15,
-    messageErrorRetryInterval: config.messageErrorRetryInterval ?? 2_000,
-    queueTimeout: Math.max(
-      config.queueTimeout ?? 300_000,
-      (config.messageTimeout ?? 60_000) + 5_000,
-      (config.dequeueInterval ?? 30_000) + 5_000,
-      (config.messageErrorRetryInterval ?? 2_000) + 5_000
-    ),
-    maxQueueRetryCount: config.maxQueueRetryCount ?? 30,
-    queueErrorRetryInterval: config.queueErrorRetryInterval ?? 2_000,
+    maxQueueRetryCount: config.maxQueueRetryCount ?? 20,
+    errorRetryInterval: config.errorRetryInterval ?? 2_000,
     dequeueInterval: config.dequeueInterval ?? 30_000,
     instanceId: config.instanceId ?? '1',
     logLevel: config.logLevel ?? 'ERROR',
@@ -124,18 +118,16 @@ export const Queue = <Body>(handler: Handler<Body>, config: Config): Cancellable
     let client: PoolClient | undefined
 
     try {
-      await timeout(async () => {
-        client = await _config.pool.connect()
-        client.on('error', (error) => _config.logger.error('pg_client_error', error, undefined, _config.instanceId))
-        await dequeue(client, handler, _config)
-      }, _config.queueTimeout)
+      client = await _config.pool.connect()
+      client.on('error', (error) => _config.logger.error('pg_client_error', error, undefined, _config.instanceId))
+      await dequeue(client, handler, _config)
+      client.removeAllListeners().release()
       errorCount = 0
     } catch (error) {
       _config.logger.error('queue_error', error, undefined, _config.instanceId)
-      if (++errorCount >= _config.maxQueueRetryCount) { throw error }
-      await sleep(_config.queueErrorRetryInterval)
-    } finally {
-      client?.removeAllListeners().release()
+      client?.removeAllListeners().release(true)
+      if (++errorCount >= _config.maxQueueRetryCount) throw error
+      await sleep(_config.errorRetryInterval)
     }
   })
 }

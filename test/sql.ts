@@ -2,6 +2,7 @@ import test from 'tape'
 import pg from 'pg'
 import { enqueue, setupPGQueue } from '../src/index.js'
 
+
 if (process.env.PG_PORT === undefined) {
   console.error('missing PG_PORT env variable')
   process.exit(1)

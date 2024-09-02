@@ -15,7 +15,7 @@ A stupid-simple Postgres-backed queue for Typescript
 
 ## Terminology
 - **message**: a single serializable datastructure to enqueue and dequeue
-- **partition**: an arbitrary subset of messages defined during message creation. as long as partitions remain reletively small/high cardinality, retrieving counts and lists of unprocessed messages per partition should remain efficient. potential partition values could be a user id, an ip address, or anything property that is distributed evenly across all messages. partitioning is not required.
+- **partition**: an arbitrary subset of messages defined when enqueueing messages. as long as partitions remain reletively small/high cardinality, retrieving counts and lists of unprocessed messages per partition should remain efficient. potential partition values could be a user id, an ip address, or any property that is distributed evenly across all messages. partitioning is not required.
 - **queue instance**: a single lightweight instance of the queue that dequeues messages, processes them, and returns them to the queue instance on error. queue instances can be created and destroyed efficiently and can run anywhere that has access to the backing Postgres database. multiple instances can run efficiently in the same process or distributed across multiple processes.
 
 
@@ -27,9 +27,9 @@ import { enqueue, Queue } from 'worlds-smallest-queue'
 /*
  * Instantiate Queue
  */
-const pool = new Pool()
+const pool = new Pool({ connectionTimeoutMillis: 60_000 })
 const QUEUE_INSTANCE_COUNT = 10
-const CONFIG = { pool, messageTimeout: 60000, messageErrorRetryInterval: 2000, maxMessageRetryCount: 10 }
+const CONFIG = { pool, messageTimeout: 60_000, errorRetryInterval: 2_000, maxMessageRetryCount: 10 }
 
 for (let i = 0; i < QUEUE_INSTANCE_COUNT; i++) {
   const queue = Queue(
@@ -103,11 +103,13 @@ If message processing is CPU bound, distribute the queue instances across multip
 
 The `Queue` constructor function returns a promise with a `teardown` method to manually tear down the queue, e.g. to resize the number of running queues, or to destroy the queue after running integration tests. You should not need to manually destroy the queue under most operating patterns.
 
+The queue will reject if it fails to dequeue a message `Config.maxQueueRetryCount [default: 30]` times in a row. Set the [`Config.connectionTimeoutMillis`](https://node-postgres.com/apis/pool) on the `pg.Pool` instance to force the queue to timeout waiting for an available connection. Persistent errors like this suggest that either Postgres is down or unreachable, or that the client pool has leaked all available clients. Typically the best course of action in cases like this is to exit and restart the process. Disable this behavior by setting `Config.maxQueueRetryCount` to `Infinity`.
+
 ```ts
 import { Pool } from 'pg'
 import { Queue } from 'worlds-smallest-queue'
 
-const pool = new Pool()
+const pool = new Pool({ connectionTimeoutMillis: 60_000 })
 const queue = Queue(async (message) => { await doWorkBeCool(message) }, { pool })
 
 queue.catch((error) => {
@@ -119,11 +121,9 @@ queue.catch((error) => {
 await queue.teardown()
 ```
 
-The queue will reject if it fails to dequeue a message `Config.maxQueueRetryCount [default: 30]` times in a row, including if it takes more than `Config.queueTimeout [default: 5min]` to dequeue a message. Persistent errors like this suggest that either Postgres is down or unreachable, or that the client pool has leaked all available clients. Typically the best course of action in cases like this is to crash and restart the server using some type of process manager. Disable this behavior by setting `Config.maxQueueRetryCount` to `Infinity`.
-
 
 ### enqueue
-`enqueue(client: ClientBase, messages: Message<Body>[], partition: number, awaitMessage?: number) => Promise<{ ids: number[], awaited?: boolean }>`
+`enqueue(client: ClientBase, messages: Message<Body>[], partition: number, options?: { awaitMessage?: number, schema: string = 'public' }) => Promise<{ ids: number[], awaited?: boolean }>`
 
 Enqueue messages to partition. Returns message ids and whether or not awaiting the message processing timed out.
 
@@ -146,7 +146,7 @@ try {
 }
 ```
 
-If the 4th optional `awaitMessage` argument is passed, waits for up to `awaitMessage` ms for all messages to be processed successfully. If the queue partition is backed up, or messages are processed slowly, or repeated errors slow or fail message processing, enqueue promise is more likely to resolve on timeout with `awaited: false`. But if the partition is not congested, messages are processed quickly, and there are no errors, then awaiting enqueued messages allows clients to know when those messages have been processed successfully.
+If the optional `options.awaitMessage` argument is passed, waits for up to `awaitMessage` ms for all messages to be processed successfully. If the queue partition is backed up, or messages are processed slowly, or repeated errors slow or fail message processing, enqueue promise is more likely to resolve on timeout with `awaited: false`. But if the partition is not congested, messages are processed quickly, and there are no errors, then awaiting enqueued messages allows clients to know when those messages have been processed successfully.
 
 ```ts
 import { Pool } from 'pg'
@@ -159,7 +159,7 @@ const partitions = 1
 let client: PoolClient | undefined
 try {
   client = await pool.connect()
-  const { ids, awaited } = await enqueue(client, messages, partition, 10_000)
+  const { ids, awaited } = await enqueue(client, messages, partition, { awaitMessage: 10_000 })
   console.log(awaited ? `successfully processed messages ${ids.join(',')}` : `still waiting to process messages ${ids.join(',')}`)
 } catch (error) {
   console.error(error)
@@ -170,7 +170,7 @@ try {
 
 
 ### setupPGQueue
-`setupPGQueue() => string`
+`setupPGQueue(schema: string = 'public') => string`
 
 Return a SQL query string to set up the queue tables. The queue schema is trivial so you can also create the tables by hand via any schema migration tool.
 
@@ -184,7 +184,7 @@ await pool.query(setupPGQueue())
 
 
 ### teardownPGQueue
-`teardownPGQueue() => string`
+`teardownPGQueue(schema: string = 'public') => string`
 
 Return a SQL query string to tear down queue tables. Similarly, the `DROP TABLES` command is trivial, meaning you don't necessarily need to use Typescript to manage the schema.
 
@@ -205,18 +205,16 @@ Queue configuration
 type Config = {
   // [required] a pg Pool instance.
   pool: Pool
+  // [default: 'public'] postgres schema namespace
+  schema: string
   // [default: 1min] ms timeout to dequeue and process a message. messages that timeout fail and are re-enqueued.
   messageTimeout: number
   // [default: 15] number of times to retry a message before adding it to the `dead_messages` table.
   maxMessageRetryCount: number
-  // [default: 2sec] ms retry interval after a failed message. if a message fails multiple times, each subsequent retry interval doubles.
-  messageErrorRetryInterval: number
-  // [default: 5min] ms timeout for the queue. setting this to a lower interval than messageTimeout, dequeueInterval, or messageErrorRetryInterval will set messageErrorRetryInterval to the maximum of all three.
-  queueTimeout: number
-  // [default: 30] number of times to retry the queue loop before it errors out.
+  // [default: 20] number of times to retry the queue loop before it errors out.
   maxQueueRetryCount: number
-  // [default 2sec] ms retry interval after a failed queue loop.
-  queueErrorRetryInterval: number
+  // [default: 2sec] ms retry interval after a failed message or queue loop. if a message fails multiple times, each subsequent retry interval doubles.
+  errorRetryInterval: number
   // [default: 30sec] ms interval to wait for new messages in the queue.
   dequeueInterval: number
   // [optional] queue instance id. used for error logging when there are multiple queues.

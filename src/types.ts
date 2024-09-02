@@ -3,12 +3,11 @@ import { type Pool, type ClientBase } from 'pg'
 
 export type Config = {
   pool: Pool,
+  schema?: string,
   messageTimeout?: number,
   maxMessageRetryCount?: number,
-  messageErrorRetryInterval?: number,
-  queueTimeout?: number,
   maxQueueRetryCount?: number
-  queueErrorRetryInterval?: number,
+  errorRetryInterval?: number,
   dequeueInterval?: number,
   instanceId?: string,
   logLevel?: 'INFO' | 'ERROR',

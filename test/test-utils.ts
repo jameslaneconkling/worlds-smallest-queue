@@ -1,4 +1,4 @@
-import { sleep } from '../src/utils'
+import { sleep } from '../src/utils.js'
 
 
 export const poll = async (asyncPredicate: () => Promise<boolean>, pollInterval: number, maxRetry: number) => {

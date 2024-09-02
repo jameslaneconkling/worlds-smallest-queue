@@ -1,40 +1,6 @@
 import test from 'tape'
-import { loop, sleep, timeout } from '../src/utils.js'
+import { loop, sleep } from '../src/utils.js'
 import { poll, sort } from './test-utils.js'
-
-
-test('timeout resolves when wrapped function resolves', async (t) => {
-  t.plan(1)
-
-  const t0 = Date.now()
-  await timeout(() => sleep(20), 30)
-  const dt = Date.now() - t0
-  t.ok(dt >= 20 && dt <= 25, 'timeout resolved')
-})
-
-
-test('timeout rejects when wrapped function rejects', async (t) => {
-  t.plan(1)
-
-  try {
-    await timeout(() => { sleep(10); throw new Error('system_fubr') }, 15)
-    t.fail('timeout should error out')
-  } catch (error) {
-    t.ok(error instanceof Error && error.message === 'system_fubr')
-  }
-})
-
-
-test('timeout rejects when time is exceeded', async (t) => {
-  t.plan(1)
-
-  try {
-    await timeout(() => sleep(20), 15)
-    t.fail('timeout should error out')
-  } catch (error) {
-    t.ok(error instanceof Error && error.message === 'timeout')
-  }
-})
 
 
 test('loops until cancel handler is called', async (t) => {

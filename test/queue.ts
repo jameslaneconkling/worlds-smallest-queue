@@ -1,6 +1,6 @@
 import test from 'tape'
 import pg from 'pg'
-import { enqueue, Queue, setupPGQueue } from '../src/index.js'
+import { enqueue, Queue, setupPGQueue, teardownPGQueue } from '../src/index.js'
 import { sleep } from '../src/utils.js'
 import { Message } from '../src/types.js'
 import { poll, sort } from './test-utils.js'
@@ -41,7 +41,7 @@ test('setup queue tests', async (t) => {
       console.error(error)
     }
   }
-  
+
   await pool.query(setupPGQueue())
 
   t.pass('setup complete')
@@ -241,7 +241,7 @@ test('retries failed messages with exponential backoff', async (t) => {
       createdAt = +message.created_at
       processedAt = Date.now()
     },
-    { pool, dequeueInterval: 25, messageErrorRetryInterval: retryInterval, maxMessageRetryCount: 6 }
+    { pool, dequeueInterval: 25, errorRetryInterval: retryInterval, maxMessageRetryCount: 6 }
   )
 
   const client = await pool.connect()
@@ -275,7 +275,7 @@ test('handles temporary message processing errors', async (t) => {
         }
         messages.push({ partition: message.partition, event: message.body.event })
       },
-      { pool, dequeueInterval: 1000, messageErrorRetryInterval: 100, instanceId: `${i}` }
+      { pool, dequeueInterval: 1000, errorRetryInterval: 100, instanceId: `${i}` }
     )
   })
 
@@ -325,7 +325,7 @@ test('handles persistent message processing errors, sending messages to the dead
         aliveMessages.push(message.body)
       }
     },
-    { pool, dequeueInterval: 1000, messageErrorRetryInterval: 10, maxMessageRetryCount: 5 }
+    { pool, dequeueInterval: 1000, errorRetryInterval: 10, maxMessageRetryCount: 5 }
   )
 
   await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 100, 100)
@@ -365,7 +365,7 @@ test('handles temporary network partition from PG', async (t) => {
 })
 
 
-test('handles processing transaction timeouts', async (t) => {
+test('handles message timeouts', async (t) => {
   t.plan(1)
 
   let i = 0
@@ -380,9 +380,10 @@ test('handles processing transaction timeouts', async (t) => {
         await sleep(1000)
       } else {
         messages.push(message)
+        await sleep(100)
       }
     },
-    { pool, dequeueInterval: 1000, messageTimeout: 500, messageErrorRetryInterval: 500 }
+    { pool, dequeueInterval: 1000, messageTimeout: 500, errorRetryInterval: 500 }
   )
 
   await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM messages')).rows[0].count === 0, 1000, 10)
@@ -427,7 +428,7 @@ test('waits for queue to process awaited messages when enqueueing with awaitMess
   const client = await pool.connect()
   await enqueue(client, [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}], 1)
   const t0 = Date.now()
-  const { ids } = await enqueue(client, [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}], 1, 1000)
+  const { ids } = await enqueue(client, [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}], 1, { awaitMessage: 1000 })
   const dt = Date.now() - t0
   await enqueue(client, [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}], 1)
   const messageCount = (await client.query<{ count: number }>('SELECT count(*)::int FROM messages WHERE id = ANY($1)', [ids])).rows[0].count
@@ -456,7 +457,7 @@ test('times out waiting for queue to process awaited messages when message proce
   const client = await pool.connect()
   await enqueue(client, [{}, {}, {}, {}], 1)
   const t0 = Date.now()
-  const { ids } = await enqueue(client, [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}], 1, 2000)
+  const { ids } = await enqueue(client, [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}], 1, { awaitMessage: 2000 })
   const dt = Date.now() - t0
   const remainingMessageIds = (await client.query<{ id: number }>('SELECT id FROM messages WHERE id = ANY($1)', [ids])).rows.map(({ id }) => id)
   const processedMessageIds = messageIds.filter((id) => ids.includes(id))
@@ -479,6 +480,97 @@ test('times out waiting for queue to process awaited messages when message proce
     new Set([...processedMessageIds, ...remainingMessageIds]).size === ids.length,
     `processed message count ${processedMessageIds.length} plus remaining message count of ${remainingMessageIds.length} is equal to total message count of ${ids.length}`
   )
+})
+
+
+test('can handle custom postgres schemas', async (t) => {
+  t.plan(4)
+
+  await pool.query('DROP SCHEMA IF EXISTS non_public CASCADE')
+  await pool.query('CREATE SCHEMA non_public')
+  await pool.query(setupPGQueue('non_public'))
+  const tablesExist = (await pool.query(`
+    SELECT FROM information_schema.tables
+    WHERE table_schema = 'non_public' AND (table_name = 'messages' OR table_name = 'dead_messages')
+  `)).rows.length === 2
+  t.ok(tablesExist, 'successfully created queue tables in custom schema')
+  
+
+  const client = await pool.connect()
+  await enqueue(client, [{ event: 'abc'}, { event: 'xyz'}, { event: '123' }], 1, { schema: 'non_public' })
+  client.release()
+
+  const enqueuedMessages = (await pool.query<{ event: string }>(`SELECT body->'event' AS event FROM non_public.messages`)).rows
+  t.deepEquals(enqueuedMessages, [{ event: 'abc'}, { event: 'xyz'}, { event: '123' }], 'successfully enqueued messages to tables with custom schema')
+
+  const messages: { event: string }[] = []
+  const queue = Queue<{ event: string }>(
+    async ({ body }) => { messages.push(body) },
+    { pool, schema: 'non_public', dequeueInterval: 500 }
+  )
+
+  await poll(async () => (await pool.query<{ count: number }>('SELECT count(*)::int FROM non_public.messages')).rows[0].count === 0, 100, 20)
+  await queue.teardown()
+
+  t.deepEquals(messages, [{ event: 'abc'}, { event: 'xyz'}, { event: '123' }], 'successfully dequeued all messages in custom schema')
+
+  await pool.query(teardownPGQueue('non_public'))
+  const tablesDNE = (await pool.query(`
+    SELECT FROM information_schema.tables
+    WHERE table_schema = 'non_public' AND (table_name = 'messages' OR table_name = 'dead_messages')
+  `)).rows.length === 0
+  await pool.query('DROP SCHEMA IF EXISTS non_public CASCADE')
+  t.ok(tablesDNE, 'successfully dropped queue tables in custom schema')
+})
+
+
+test('times out if connection can not be obtained from pool', async (t) => {
+  t.plan(1)
+
+  const pool = new pg.Pool({
+    user: 'postgres',
+    database: 'worlds-smallest-queue-test',
+    password: 'test',
+    port: parseInt(process.env.PG_PORT!, 10),
+    max: 10,
+    connectionTimeoutMillis: 250
+  })
+  const client = await pool.connect()
+  await enqueue(client, [{}], 1)
+  client.release()
+
+  const connections = await Promise.all(Array.from({ length: 10 }).map(() => pool.connect()))
+
+  const queue = Queue(
+    async () => t.fail('should not run'),
+    { pool, errorRetryInterval: 250, maxQueueRetryCount: 3 }
+  )
+
+  await queue.catch((error) => {
+    t.ok(error instanceof Error && error.message === 'timeout exceeded when trying to connect', 'queue rejects on repeated timeout')
+  })
+
+  connections.forEach((connection) => connection.release())
+  await pool.end()
+})
+
+
+test('gracefully errors out if message tables do not exist', async (t) => {
+  t.plan(2)
+
+  await pool.query(teardownPGQueue())
+
+  const queue = Queue(
+    async () => t.fail('should not run'),
+    { pool, errorRetryInterval: 100, maxQueueRetryCount: 3 }
+  )
+
+  await queue.catch((error) => {
+    t.ok(error instanceof Error && error.message === 'relation "messages" does not exist', 'queue rejects if message tables do not exist')
+  })
+
+  await pool.query(setupPGQueue())
+  t.pass('done')
 })
 
 
@@ -557,24 +649,40 @@ test('handles high throughput async message processing without dropping messages
 })
 
 
-test('is not vulnerable to sql injection', async (t) => {
+test('enqueued messages are not vulnerable to sql injection', async (t) => {
   t.plan(1)
 
-  const injection = [{ x: `1"}'); DROP TABLE messages --` }]
+  // const injection = [{ x: `1"}'); DROP TABLE messages; --` }]
+  const injection = [{ x: `1\\0022}'); DROP TABLE messages; --` }]
   
   const client = await pool.connect()
   try {
     await enqueue(client, injection, 1)
   } catch (error) {
-    if (error !== null && typeof error === 'object' && 'routine' in error && error.routine !== 'json_errsave_error') {
-      console.error(error)
-    } else {
-      t.fail(error)
-    }
+    console.error(error)
   }
   client.release()
 
   const messageTableExists = (await pool.query<{ exists: boolean }>('SELECT to_regclass(\'messages\') IS NOT NULL AS exists;')).rows[0].exists
+  t.ok(messageTableExists, 'attempted sql injection does not succeed at dropping messages table')
+})
+
+
+test('custom schemas are not vulnerable to sql injection', async (t) => {
+  t.plan(1)
+  
+  let client = await pool.connect()
+  try {
+    await enqueue(client, [{}], 1, { schema: 'public; DROP TABLE MESSAGES;' })
+  } catch (error) {
+    console.error(error)
+  }
+  client.release()
+
+  client = await pool.connect()
+  await client.query('SET search_path TO public')
+  const messageTableExists = (await client.query<{ exists: boolean }>('SELECT to_regclass(\'messages\') IS NOT NULL AS exists;')).rows[0].exists
+  client.release()
   t.ok(messageTableExists, 'attempted sql injection does not succeed at dropping messages table')
 })
 
